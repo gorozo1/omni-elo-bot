@@ -1,0 +1,3 @@
+openai>=1.68,<3
+imageio-ffmpeg>=0.5,<1
+pyTelegramBotAPI>=4.27,<5

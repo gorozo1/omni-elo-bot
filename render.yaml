@@ -1,0 +1,27 @@
+services:
+  - type: worker
+    name: omni-elo-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.15.2
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openai/gpt-audio
+      - key: OPENROUTER_VISION_MODEL
+        value: openai/gpt-4o-mini
+      - key: DATABASE_PATH
+        value: /var/data/sessions.sqlite3
+      - key: LOG_FILE
+        value: /var/data/omni-elo-bot.log
+      - key: ADMIN_USER_IDS
+        sync: false

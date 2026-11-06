@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+.venv-py39-backup/
+data/
+.pytest_cache/
