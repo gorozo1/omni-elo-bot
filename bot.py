@@ -70,14 +70,17 @@ MODEL_NAME = os.getenv("OPENROUTER_MODEL", "openai/gpt-audio")
 VISION_MODEL_NAME = os.getenv("OPENROUTER_VISION_MODEL", "openai/gpt-4o-mini")
 MAX_MEDIA_BYTES = int(os.getenv("MAX_MEDIA_BYTES", str(20 * 1024 * 1024)))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/sessions.sqlite3")
+WAIT_EVALUATION_TYPE = "wait_evaluation_type"
 WAIT_REFERENCE = "wait_reference"
 WAIT_PROMPT = "wait_prompt"
 WAIT_RESPONSE_A = "wait_response_a"
 WAIT_RESPONSE_B = "wait_response_b"
+EVALUATION_SINGLE = "single_speaker"
+EVALUATION_DIALOGUE = "two_speaker_dialogue"
 
 BOT_COMMANDS = (
-    ("start", "Start an evaluation"),
-    ("newtask", "Reset and start a new evaluation"),
+    ("start", "Choose an evaluation type"),
+    ("newtask", "Reset and choose an evaluation type"),
     ("status", "Show the current evaluation step"),
     ("cancel", "Cancel the current evaluation"),
     ("myid", "Show your Telegram user ID"),
@@ -132,10 +135,36 @@ SCORING_SCHEMA = {
     ],
 }
 
+DIALOGUE_VERDICTS = ["[Conversation A]", "[Conversation B]", "[Both Good]", "[Both Bad]"]
+DIALOGUE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "responsiveness_verdict": {"type": "string", "enum": DIALOGUE_VERDICTS},
+        "responsiveness_breakdown": {"type": "string"},
+        "conversational_naturalness_verdict": {"type": "string", "enum": DIALOGUE_VERDICTS},
+        "conversational_naturalness_breakdown": {"type": "string"},
+        "overall_preference": {"type": "string", "enum": DIALOGUE_VERDICTS},
+        "conversation_a_classification": {"type": "string", "enum": ["Human recording", "AI-generated"]},
+        "conversation_b_classification": {"type": "string", "enum": ["Human recording", "AI-generated"]},
+        "justification": {"type": "string"},
+    },
+    "required": [
+        "responsiveness_verdict",
+        "responsiveness_breakdown",
+        "conversational_naturalness_verdict",
+        "conversational_naturalness_breakdown",
+        "overall_preference",
+        "conversation_a_classification",
+        "conversation_b_classification",
+        "justification",
+    ],
+}
+
 
 @dataclass
 class Session:
     state: str
+    evaluation_type: str = EVALUATION_SINGLE
     reference_audio: bytes | None = None
     reference_mime: str | None = None
     prompt_text: str | None = None
@@ -194,6 +223,7 @@ class SessionStore:
         payload = json.dumps(
             {
                 "state": session.state,
+                "evaluation_type": session.evaluation_type,
                 "reference_mime": session.reference_mime,
                 "prompt_text": session.prompt_text,
                 "prompt_image_mime": session.prompt_image_mime,
@@ -247,7 +277,31 @@ def is_greeting(text: str) -> bool:
     return normalized.startswith(tuple(f"{greeting} " for greeting in greetings))
 
 
-def score_prompt() -> str:
+def score_prompt(evaluation_type: str = EVALUATION_SINGLE) -> str:
+    if evaluation_type == EVALUATION_DIALOGUE:
+        return (
+            "You are an expert audio evaluation assistant for OMNI TTS ELO, specializing in two-speaker "
+            "dialogue analysis. Compare Conversation A and Conversation B against the supplied multi-turn "
+            "script for Speaker 1 and Speaker 2. Evaluate the conversation as an interaction, not as two isolated "
+            "voice-cloning samples. Do not invent evidence that is not audible. Return concise, concrete English "
+            "breakdowns and exactly the requested JSON fields.\n\n"
+            "MULTI-SPEAKER EVALUATION RUBRIC\n"
+            "1. Responsiveness to the Other Speaker: choose [Conversation A], [Conversation B], [Both Good], or "
+            "[Both Bad]. Judge whether emotion, energy, pace, and tone react naturally to the preceding turn, "
+            "including laughter at humor, shared excitement, and sensitivity to serious points. Penalize flat, "
+            "disconnected, or contextually mismatched replies.\n"
+            "2. Conversational Naturalness: choose [Conversation A], [Conversation B], [Both Good], or [Both Bad]. "
+            "Judge the whole exchange for spontaneous two-person rhythm, turn timing, pauses, casual delivery, "
+            "and whether the speakers sound like people responding to each other rather than reading separate lines.\n"
+            "3. Overall Preference: choose exactly one of [Conversation A], [Conversation B], [Both Good], or "
+            "[Both Bad], based on the whole conversation.\n"
+            "4. Classify each recording independently as exactly [Human recording] or [AI-generated]. Base this on "
+            "audible evidence from the full conversation; do not assume synthetic voices are human or vice versa.\n\n"
+            "Each of the two breakdowns must be 1-2 concise sentences and cite evidence from both conversations. "
+            "The justification must be plain language, 15-25 words, naming the overall choice and the main "
+            "interactive reason. Keep all field values as plain text without markup, headings, or bullets; the app "
+            "adds visual formatting. Return only a JSON object following the supplied schema."
+        )
     return (
         "You are the OMNI TTS ELO evaluator. Strictly compare two Vietnamese TTS recordings against the supplied "
         "prompt text or screenshot and optional reference voice. Listen for every noticeable error in both clips; "
@@ -260,7 +314,9 @@ def score_prompt() -> str:
         "2. Persona Likeness: choose [N/A] when the reference is none; otherwise choose one pairwise verdict. "
         "Compare voice identity, perceived age and gender, accent, pitch, and timbre to the reference. Explicit "
         "gender or strong regional accent mismatch is a major failure. Do not confuse emotional variation with "
-        "a different voice identity. Strong persona adherence beats merely higher naturalness.\n"
+        "a different voice identity. Strong persona adherence beats merely higher naturalness. When reference "
+        "audio is supplied, it is mandatory evidence: listen to it first and compare both responses against it. "
+        "Never select [N/A] or claim no reference was provided when a reference audio part is present.\n"
         "3. Pronunciation Faithfulness: compare spoken content to the prompt, including Vietnamese words, tone "
         "marks, numbers, times, units, punctuation meaning, omissions, additions, and hallucinated fillers. Judge "
         "speech clarity separately; clarity never excuses text errors. Expand numbers, times, and units naturally "
@@ -280,7 +336,8 @@ def score_prompt() -> str:
         "Each breakdown must be 1-2 concise sentences and mention relevant evidence for both responses. Do not "
         "use vague phrases such as 'B is better', 'sounds good', or 'A is bad'. The final summary is the copy-ready "
         "justification: 15-25 words and at least 100 characters, naming the winner, dominant factor, concrete "
-        "flaws in both clips, and any trade-off. Use plain language.\n\n"
+        "flaws in both clips, and any trade-off. Use plain language. Keep every field value as plain text without "
+        "markup, headings, or bullets; the app adds visual formatting.\n\n"
         "VERIFIED COMPARISON EXAMPLES\n"
         "- A has stiff repetitive cadence and poor sentence pauses while B is more natural: winner B, dominant "
         "factor Naturalness.\n"
@@ -292,7 +349,47 @@ def score_prompt() -> str:
     )
 
 
-def format_result(result: dict) -> str:
+def format_dialogue_result(result: dict) -> str:
+    dialogue_verdicts = set(DIALOGUE_VERDICTS)
+    responsiveness = str(result["responsiveness_verdict"])
+    naturalness = str(result["conversational_naturalness_verdict"])
+    preference = str(result["overall_preference"])
+    classifications = (
+        str(result["conversation_a_classification"]),
+        str(result["conversation_b_classification"]),
+    )
+    if responsiveness not in dialogue_verdicts:
+        raise ValueError("Invalid responsiveness verdict")
+    if naturalness not in dialogue_verdicts:
+        raise ValueError("Invalid conversational naturalness verdict")
+    if preference not in dialogue_verdicts:
+        raise ValueError("Invalid overall preference")
+    if any(value not in {"Human recording", "AI-generated"} for value in classifications):
+        raise ValueError("Invalid human-or-AI classification")
+
+    return "\n".join(
+        [
+            "<b>🔍 Multi-Speaker Evaluation Breakdown</b>",
+            "",
+            f"⚡ <b>Responsiveness to the Other Speaker:</b> {escape_html(responsiveness)}\n{escape_html(result['responsiveness_breakdown'])}",
+            "",
+            f"💬 <b>Conversational Naturalness:</b> {escape_html(naturalness)}\n{escape_html(result['conversational_naturalness_breakdown'])}",
+            "",
+            "<b>🏆 Final Verdict</b>",
+            f"<b>Overall Preference:</b> {escape_html(preference)}",
+            f"<b>Conversation A Classification:</b> {escape_html(classifications[0])}",
+            f"<b>Conversation B Classification:</b> {escape_html(classifications[1])}",
+            "",
+            "<b>✍️ Justification (Ready to Copy-Paste)</b>",
+            f'"{escape_html(result["justification"])}"',
+        ]
+    )
+
+
+def format_result(result: dict, evaluation_type: str = EVALUATION_SINGLE) -> str:
+    if evaluation_type == EVALUATION_DIALOGUE:
+        return format_dialogue_result(result)
+
     def verdict(key: str, fallback: str = "[Both Good]") -> str:
         return str(result.get(key, fallback))
 
@@ -311,19 +408,20 @@ def format_result(result: dict) -> str:
         raise ValueError("winner must be A or B")
     pronunciation = breakdown("pronunciation_breakdown", "pronunciation")
     technical_verdict = verdict("technical_string_verdict", "[N/A]")
-    technical_details = result.get("technical_string_details")
-    if technical_details:
-        pronunciation = f"{pronunciation} Technical string verdict: {technical_verdict}. {technical_details}"
-    else:
-        pronunciation = f"Technical string verdict: {technical_verdict}. {pronunciation}"
+    technical_details = result.get("technical_string_details") or "No technical-string details were provided."
 
     lines = [
         "<b>🔍 Evaluation Breakdown</b>",
         "",
-        f"<b>Audio and Recording Quality:</b> {escape_html(verdict('audio_recording_quality_verdict'))} - {escape_html(breakdown('audio_recording_quality_breakdown', 'audio_quality'))}",
-        f"<b>Persona likeness (Speaker Similarity):</b> {escape_html(verdict('persona_likeness_verdict', '[N/A]'))} - {escape_html(breakdown('persona_likeness_breakdown', 'persona_likeness'))}",
-        f"<b>Pronunciation Faithfulness:</b> {escape_html(verdict('pronunciation_faithfulness_verdict'))} - {escape_html(pronunciation)}",
-        f"<b>Naturalness:</b> {escape_html(verdict('naturalness_verdict', '[Response A]'))} - {escape_html(breakdown('naturalness_breakdown', 'naturalness'))}",
+        f"🔊 <b>Audio and Recording Quality: {escape_html(verdict('audio_recording_quality_verdict'))}</b>\n{escape_html(breakdown('audio_recording_quality_breakdown', 'audio_quality'))}",
+        "",
+        f"🎭 <b>Persona Likeness (Speaker Similarity): {escape_html(verdict('persona_likeness_verdict', '[N/A]'))}</b>\n{escape_html(breakdown('persona_likeness_breakdown', 'persona_likeness'))}",
+        "",
+        f"🗣 <b>Pronunciation Faithfulness: {escape_html(verdict('pronunciation_faithfulness_verdict'))}</b>\n{escape_html(pronunciation)}",
+        "",
+        f"🔢 <b>Technical String Check: {escape_html(technical_verdict)}</b>\n{escape_html(str(technical_details))}",
+        "",
+        f"🎶 <b>Naturalness: {escape_html(verdict('naturalness_verdict', '[Response A]'))}</b>\n{escape_html(breakdown('naturalness_breakdown', 'naturalness'))}",
         "",
         "<b>🏆 Final Verdict</b>",
         f"<b>Overall Preference:</b> Response {winner}",
@@ -333,6 +431,20 @@ def format_result(result: dict) -> str:
         f'"{escape_html(result["summary"])}"',
     ]
     return "\n".join(lines)
+
+
+def parse_model_json(response_text: str) -> dict:
+    text = response_text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as original_error:
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise original_error
+        return json.loads(text[start : end + 1])
 
 
 def audio_input_part(audio_data: bytes) -> dict:
@@ -373,28 +485,54 @@ def audio_input_part(audio_data: bytes) -> dict:
 
 
 def build_messages(session: Session) -> list[dict]:
-    user_content = [{"type": "text", "text": f"Prompt text:\n{session.prompt_text or '(no text prompt provided)'}"}]
+    is_dialogue = session.evaluation_type == EVALUATION_DIALOGUE
+    prompt_label = "Multi-turn dialogue script for Speaker 1 and Speaker 2" if is_dialogue else "Prompt text"
+    audio_a_label = "Conversation A audio (Speaker 1 and Speaker 2)" if is_dialogue else "Response A audio"
+    audio_b_label = "Conversation B audio (Speaker 1 and Speaker 2)" if is_dialogue else "Response B audio"
+    user_content = []
     if session.reference_audio is None:
-        user_content.append({"type": "text", "text": "Reference voice: none was provided."})
+        reference_instruction = (
+            "MANDATORY REFERENCE VOICE: None provided. Persona likeness is not applicable."
+            if not is_dialogue
+            else "Optional reference voice: none was provided."
+        )
+        user_content.append({"type": "text", "text": reference_instruction})
     else:
+        reference_instruction = (
+            "MANDATORY REFERENCE VOICE: Listen to this audio first. For single-speaker evaluation, use it as "
+            "the required persona-likeness anchor for both responses. It is present and must not be reported as "
+            "missing or not applicable."
+            if not is_dialogue
+            else "Optional reference voice audio is included before the script and conversation clips."
+        )
         user_content.extend(
             [
-                {"type": "text", "text": "Reference voice audio:"},
+                {"type": "text", "text": reference_instruction},
                 audio_input_part(session.reference_audio),
             ]
         )
+    user_content.append(
+        {"type": "text", "text": f"{prompt_label}:\n{session.prompt_text or '(no text prompt provided)'}"}
+    )
     user_content.extend(
         [
-            {"type": "text", "text": "Response A audio:"},
+            {"type": "text", "text": f"{audio_a_label}:"},
             audio_input_part(session.response_a),
-            {"type": "text", "text": "Response B audio:"},
+            {"type": "text", "text": f"{audio_b_label}:"},
             audio_input_part(session.response_b),
         ]
     )
+    if is_dialogue:
+        schema = DIALOGUE_SCHEMA
+    else:
+        schema = json.loads(json.dumps(SCORING_SCHEMA))
+        schema["properties"]["persona_likeness_verdict"]["enum"] = (
+            PAIRWISE_VERDICTS if session.reference_audio is not None else ["[N/A]"]
+        )
     system_prompt = (
-        score_prompt()
+        score_prompt(session.evaluation_type)
         + "\n\nReturn a JSON object following this schema:\n"
-        + json.dumps(SCORING_SCHEMA, ensure_ascii=False)
+        + json.dumps(schema, ensure_ascii=False)
     )
     return [
         {"role": "system", "content": system_prompt},
@@ -479,12 +617,17 @@ def create_bot():
             return user_locks.setdefault(user_id, threading.Lock())
 
     def begin_task(message, source: str):
-        store.put(message.from_user.id, Session(state=WAIT_REFERENCE))
+        store.put(message.from_user.id, Session(state=WAIT_EVALUATION_TYPE))
         logger.info("Task started user_id=%s source=%s", message.from_user.id, source)
+        keyboard = telebot.types.InlineKeyboardMarkup()
+        keyboard.row(
+            telebot.types.InlineKeyboardButton("Single-speaker", callback_data="evaluation:single"),
+            telebot.types.InlineKeyboardButton("Two-speaker dialogue", callback_data="evaluation:dialogue"),
+        )
         telegram.reply_to(
             message,
-            "Ready for the next evaluation. Please send or record the *Reference Voice* (or type 'none' if there is no reference).",
-            parse_mode="Markdown",
+            "Choose an evaluation type:",
+            reply_markup=keyboard,
         )
 
     @telegram.message_handler(commands=["start", "newtask"])
@@ -513,6 +656,7 @@ def create_bot():
             telegram.reply_to(message, "No active evaluation. Send /newtask to begin.")
             return
         status_by_state = {
+            WAIT_EVALUATION_TYPE: "Waiting for you to choose single-speaker or two-speaker dialogue evaluation.",
             WAIT_REFERENCE: "Waiting for the reference voice, or `none`.",
             WAIT_PROMPT: "Waiting for prompt text or a screenshot.",
             WAIT_RESPONSE_A: "Waiting for Response A audio.",
@@ -530,6 +674,29 @@ def create_bot():
     @telegram.message_handler(commands=["myid"])
     def my_id_command(message):
         telegram.reply_to(message, f"Your Telegram user ID is {message.from_user.id}.")
+
+    @telegram.callback_query_handler(
+        func=lambda call: call.data in {"evaluation:single", "evaluation:dialogue"}
+    )
+    def choose_evaluation_type(call):
+        user_id = call.from_user.id
+        with lock_for(user_id):
+            session = store.get(user_id)
+            if session is None or session.state != WAIT_EVALUATION_TYPE:
+                telegram.answer_callback_query(call.id, "Start a new task before choosing a type.", show_alert=True)
+                return
+            session.evaluation_type = (
+                EVALUATION_DIALOGUE if call.data == "evaluation:dialogue" else EVALUATION_SINGLE
+            )
+            session.state = WAIT_REFERENCE
+            store.put(user_id, session)
+            telegram.answer_callback_query(call.id)
+            logger.info("Evaluation type selected user_id=%s type=%s", user_id, session.evaluation_type)
+            telegram.send_message(
+                call.message.chat.id,
+                "Ready for the next evaluation. Please send or record the *Reference Voice* (or type 'none' if there is no reference).",
+                parse_mode="Markdown",
+            )
 
     @telegram.message_handler(commands=["logs"])
     def logs_command(message):
@@ -584,6 +751,27 @@ def create_bot():
                 telegram.reply_to(message, "Send *new task* to start an evaluation.", parse_mode="Markdown")
                 return
 
+            status_message = None
+
+            def show_processing_error(error: Exception) -> None:
+                error_text = (
+                    f"⚠️ <b>Evaluation failed.</b>\n{escape_html(str(error))}\n"
+                    "Send Response B again to retry, or /cancel."
+                )
+                if status_message is not None:
+                    try:
+                        telegram.edit_message_text(
+                            error_text,
+                            status_message.chat.id,
+                            status_message.message_id,
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        logger.exception("Could not update evaluation status message user_id=%s", user_id)
+                        telegram.reply_to(message, "Evaluation failed. Send Response B again to retry, or use /cancel.")
+                else:
+                    telegram.reply_to(message, str(error))
+
             try:
                 if session.state == WAIT_REFERENCE:
                     if text.casefold() == "none":
@@ -625,8 +813,20 @@ def create_bot():
                     session.response_b, session.response_b_mime = get_audio(telegram, message)
                     store.put(user_id, session)
                     logger.info("Response B received user_id=%s bytes=%s mime=%s", user_id, len(session.response_b), session.response_b_mime)
+                    status_message = telegram.reply_to(
+                        message,
+                        "🔄 <b>Evaluating both recordings...</b>",
+                        parse_mode="HTML",
+                    )
                     evaluation_started = time.monotonic()
-                    logger.info("Evaluation started user_id=%s model=%s", user_id, MODEL_NAME)
+                    logger.info(
+                        "Evaluation started user_id=%s type=%s model=%s has_reference=%s reference_audio_bytes=%s",
+                        user_id,
+                        session.evaluation_type,
+                        MODEL_NAME,
+                        session.reference_audio is not None,
+                        len(session.reference_audio) if session.reference_audio is not None else 0,
+                    )
                     if session.prompt_image is not None:
                         screenshot_text = extract_prompt_from_image(client, session)
                         if session.prompt_text:
@@ -646,26 +846,38 @@ def create_bot():
                     response_text = response.choices[0].message.content
                     if not response_text:
                         raise RuntimeError("OpenRouter returned an empty evaluation.")
-                    result = json.loads(response_text)
+                    result = parse_model_json(response_text)
+                    if (
+                        session.evaluation_type == EVALUATION_SINGLE
+                        and session.reference_audio is not None
+                        and result.get("persona_likeness_verdict") == "[N/A]"
+                    ):
+                        raise RuntimeError("The model marked the supplied reference voice as not applicable.")
                     logger.info(
-                        "Evaluation completed user_id=%s winner=%s dominant_factor=%s duration_seconds=%.2f",
+                        "Evaluation completed user_id=%s type=%s preference=%s duration_seconds=%.2f",
                         user_id,
-                        result.get("winner"),
-                        result.get("dominant_factor"),
+                        session.evaluation_type,
+                        result.get("overall_preference", result.get("winner")),
                         time.monotonic() - evaluation_started,
                     )
                     telegram.send_message(
                         message.chat.id,
-                        format_result(result),
+                        format_result(result, session.evaluation_type),
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
                     store.delete(user_id)
+                    try:
+                        telegram.delete_message(message.chat.id, status_message.message_id)
+                    except Exception:
+                        logger.warning("Could not remove evaluation status message user_id=%s", user_id)
             except ValueError as error:
-                telegram.reply_to(message, str(error))
-            except Exception:
+                show_processing_error(error)
+            except Exception as error:
                 logger.exception("Task failed for Telegram user %s", user_id)
-                if session.state == WAIT_RESPONSE_B:
+                if status_message is not None:
+                    show_processing_error(error)
+                elif session.state == WAIT_RESPONSE_B:
                     telegram.reply_to(message, "Evaluation failed. Send Response B again to retry, or use /cancel.")
                 else:
                     telegram.reply_to(message, "I couldn't process that input. Please retry the current step.")

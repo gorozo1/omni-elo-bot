@@ -1,6 +1,6 @@
 # OMNI TTS ELO Evaluation Bot
 
-Telegram bot for pairwise Vietnamese text-to-speech evaluations. It collects a reference voice (optional), a text or image prompt, and two recordings, then asks OpenAI GPT Audio through OpenRouter to compare them.
+Telegram bot for pairwise Vietnamese TTS evaluations. At task start, choose single-speaker comparison or two-speaker dialogue comparison. Both modes collect a reference voice (optional), a text or image prompt/script, and two recordings, then use OpenAI GPT Audio through OpenRouter.
 
 ## Requirements
 
@@ -24,11 +24,11 @@ set -a && source .env && set +a
 python bot.py
 ```
 
-The bot accepts `new task`, then requests the reference voice or `none`, the prompt text or screenshot, Response A, and Response B. Media is limited to 20 MB by default; adjust `MAX_MEDIA_BYTES` if needed and supported by your Telegram/Gemini setup.
+After `/start`, `/newtask`, or `new task`, choose an evaluation type. Both types then follow the same five-step sequence: reference voice or `none`, prompt text or screenshot, first recording, second recording, and evaluation. For dialogue mode, the prompt should identify Speaker 1 and Speaker 2 turns. Media is limited to 20 MB by default; adjust `MAX_MEDIA_BYTES` if needed for your Telegram/OpenRouter setup.
 
 ## Telegram commands
 
-- `/start` or `/newtask` starts or resets your evaluation session.
+- `/start` or `/newtask` starts or resets your session and asks you to choose single-speaker or two-speaker dialogue evaluation.
 - `/status` shows which input the bot is waiting for.
 - `/cancel` discards your active session.
 - `/help` lists available commands.
@@ -45,7 +45,9 @@ In Telegram, send `/myid` to get your numeric Telegram user ID. Add that ID to `
 
 ## Evaluation and Elo
 
-OpenRouter's `openai/gpt-audio` compares overall quality, naturalness/prosody, Vietnamese pronunciation and intelligibility, prompt fidelity, and recording quality. Audio is converted to MP3, base64-encoded, and sent as audio input. The reference audio is a style target, not a required input. Screenshots are transcribed by the configured vision model (`OPENROUTER_VISION_MODEL`) before evaluation.
+Both evaluation modes send the prompt/script and base64-encoded MP3 audio to OpenRouter's `openai/gpt-audio`; the selected mode controls the evaluator instructions, JSON schema, labels, and Telegram report. Single-speaker mode evaluates recording quality, persona likeness, pronunciation/text faithfulness, naturalness, and preference. Two-speaker mode evaluates conversational responsiveness, conversational naturalness, whole-conversation preference, and independently classifies each clip as human or AI-generated. Audio is converted to MP3 before sending. Screenshots are transcribed by `OPENROUTER_VISION_MODEL` before either mode evaluates the recordings. The model is prompted for JSON; the response parser also handles fenced JSON because this model does not accept a `response_format` parameter.
+
+For single-speaker tasks, a supplied reference recording is sent as the first audio part, explicitly labeled as mandatory persona evidence. The response schema allows `[N/A]` for Persona Likeness only when no reference was supplied. Evaluation-start logs record whether a reference is present and its byte count, never its contents.
 
 Each pair is rated as an isolated duel, with both responses starting at 1000 and a configurable `ELO_K_FACTOR` (default 32). The bot does not assume that Response A or B identifies a persistent voice across tasks. The Elo helper can be adapted to persistent competitor IDs if the workflow later supplies those identities.
 
